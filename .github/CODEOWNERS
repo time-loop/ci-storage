@@ -1,0 +1,3 @@
+# The rules are processed top to bottom.
+# Default repo owners for anything not covered by specific rules below
+* @time-loop/Team-Eng-Engineering-Productivity
