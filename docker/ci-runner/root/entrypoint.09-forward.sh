@@ -2,24 +2,51 @@
 #
 # Sets up port forwarding to the storage host.
 #
+# Format for each entry in FORWARD_PORTS:
+# - 1234 (implies tcp)
+# - 1234/udp
+# - 1234/tcp
+# - 1234/tcp-backup (flips primary server with backup in FORWARD_HOST list)
+#
 set -u -e
 
 if [[ "$FORWARD_HOST" != "" && "$FORWARD_PORTS" != "" ]]; then
-  FORWARD_HOST="${FORWARD_HOST%%:*}"
+  # Remove port numbers from the FORWARD_HOST list, in case the client passed
+  # them. Sometimes, it's easier to erase the port numbers here than on the
+  # client's side, where FORWARD_HOST is passed as host:ignored_port from some
+  # other data source.
+  FORWARD_HOST=$(echo "$FORWARD_HOST" | sed -E 's/:[0-9]+//g')
 
   tcp_lines=()
   udp_lines=()
   for spec in $FORWARD_PORTS; do
+    hosts=$(echo "$FORWARD_HOST" | xargs)
     port=${spec%%/*}
     proto=${spec##*/}
-    [[ "$proto" == "$port" ]] && proto=tcp
+    if [[ "$proto" == "$port" ]]; then
+      proto=tcp
+    fi
+    if [[ "$proto" == "tcp-backup" ]]; then
+      proto="tcp"
+      hosts=$(echo "$FORWARD_HOST" | awk '{for(i=NF;i>0;i--) printf "%s ", $i; print ""}' | xargs)
+    fi
     if [[ "$proto" == udp ]]; then
-      udp_lines+=("127.0.0.1 $port/$proto $FORWARD_HOST $port/$proto")
+      # UDP forwarding doesn't support backup servers, so use the first host.
+      udp_lines+=("127.0.0.1 $port/$proto ${hosts%% *} $port/$proto")
     else
       tcp_lines+=("listen ${proto}_${port}")
       tcp_lines+=("  bind 127.0.0.1:$port")
-      # ipv4 is needed for e.g. host.docker.internal
-      tcp_lines+=("  server server1 $FORWARD_HOST:$port resolvers res resolve-prefer ipv4")
+      i=0
+      for host in $hosts; do
+        # ipv4 is needed for e.g. host.docker.internal
+        tcp_line="  server server$i $host:$port resolvers res resolve-prefer ipv4 check inter 10s fall 6 rise 6"
+        if [[ $i == 0 ]]; then
+          tcp_lines+=("$tcp_line")
+        else
+          tcp_lines+=("$tcp_line backup")
+        fi
+        i=$((i+1))
+      done
       tcp_lines+=("  mode $proto")
     fi
   done
