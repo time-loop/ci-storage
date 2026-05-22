@@ -12,7 +12,6 @@ from api_gh import (
     gh_predict_workflow_labels,
     gh_webhook_ensure_absent,
     gh_webhook_ensure_exists,
-    gh_webhook_ping,
 )
 from api_aws import (
     DRY_RUN_MSG,
@@ -20,20 +19,21 @@ from api_aws import (
     aws_cloudwatch_put_metric_data,
 )
 from helpers import (
-    ExpiringDict,
     PostJsonHttpRequestHandler,
     AsgSpec,
     log,
     logged_result,
 )
-from typing import Any, Literal, cast
+from storage import StorageFactory
+from typing import Any, Literal
+from zlib import crc32
 
 
 DUPLICATED_EVENTS_TTL = 3600
 JOB_TIMING_TTL = 3600 * 2
 WORKFLOW_TTL = 3600
-WORKFLOW_RUN_EVENT = "workflow_run"
-WORKFLOW_JOB_EVENT = "workflow_job"
+WORKFLOW_RUN_EVENT = "workflow_run"  # https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_run
+WORKFLOW_JOB_EVENT = "workflow_job"  # https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_job
 IGNORE_KEYS = [
     "zen",
     "hook_id",
@@ -44,42 +44,51 @@ IGNORE_KEYS = [
     "action",
 ]
 URL_PATH = "/ci-storage"
-SERVICE_ACTION_INTERVAL_SEC = 10
+WEBHOOK_ENSURE_EXISTS_INTERVAL_SEC = 60
 
 
 @dataclasses.dataclass
 class Webhook:
     url: str
-    last_delivery_at: int | None
-
-
-@dataclasses.dataclass
-class ServiceAction:
-    prev_at: int
-    iteration: int = 0
+    ensure_exists_at: int
 
 
 @dataclasses.dataclass
 class JobTiming:
     job_id: int
-    queued_at: float | None = None
-    started_at: float | None = None
-    completed_at: float | None = None
-    bumped: set[str] = dataclasses.field(default_factory=set)
+    queued_at: int | None = None
+    started_at: int | None = None
+    completed_at: int | None = None
+    bumped: list[str] = dataclasses.field(default_factory=list)
 
 
 class HandlerWebhooks:
-    def __init__(self, *, domain: str, asg_specs: list[AsgSpec]):
+    def __init__(
+        self,
+        *,
+        domain: str,
+        asg_specs: list[AsgSpec],
+        storage: StorageFactory,
+    ):
         self.domain = domain
         self.asg_specs = asg_specs
         self.webhooks: dict[str, Webhook] = {}
-        self.service_action = ServiceAction(prev_at=int(time.time()))
         self.secret = gh_get_webhook_secret()
-        self.duplicated_events = ExpiringDict[tuple[int, str], float](
-            ttl=DUPLICATED_EVENTS_TTL
+        self.duplicated_events = storage.create(
+            int,
+            ttl=DUPLICATED_EVENTS_TTL,
+            name="duplicated-events",
         )
-        self.job_timings = ExpiringDict[int, JobTiming](ttl=JOB_TIMING_TTL)
-        self.workflows = ExpiringDict[str, dict[str, Any]](ttl=WORKFLOW_TTL)
+        self.job_timings = storage.create(
+            JobTiming,
+            ttl=JOB_TIMING_TTL,
+            name="job-timings",
+        )
+        self.workflows = storage.create(
+            dict[str, Any],
+            ttl=WORKFLOW_TTL,
+            name="workflows",
+        )
         this = self
 
         class RequestHandler(PostJsonHttpRequestHandler):
@@ -91,7 +100,7 @@ class HandlerWebhooks:
     def __enter__(self):
         if not self.secret:
             return self
-        for repository in list(set(asg_spec.repository for asg_spec in self.asg_specs)):
+        for repository in set(asg_spec.repository for asg_spec in self.asg_specs):
             url = f"https://{self.domain}{URL_PATH}"
             with logged_result(doing=f"Registering webhook for {repository}: {url}"):
                 gh_webhook_ensure_exists(
@@ -100,7 +109,10 @@ class HandlerWebhooks:
                     secret=self.secret,
                     events=[WORKFLOW_RUN_EVENT, WORKFLOW_JOB_EVENT],
                 )
-                self.webhooks[repository] = Webhook(url=url, last_delivery_at=None)
+                self.webhooks[repository] = Webhook(
+                    url=url,
+                    ensure_exists_at=int(time.time()),
+                )
         return self
 
     def __exit__(self, *_: Any):
@@ -112,20 +124,25 @@ class HandlerWebhooks:
                 gh_webhook_ensure_absent(repository=repository, url=webhook.url)
 
     def service_actions(self):
-        now = int(time.time())
-        if now > self.service_action.prev_at + SERVICE_ACTION_INTERVAL_SEC:
-            i = self.service_action.iteration
-            self.service_action.iteration += 1
-            self.service_action.prev_at = now
-            webhooks = [*self.webhooks.items()]
-            if webhooks:
-                repository, webhook = webhooks[i % len(webhooks)]
-                if webhook.last_delivery_at is None:
-                    with logged_result(
-                        swallow=True,
-                        doing=f"Sending additional PING to webhook for {repository}: {webhook.url}",
-                    ):
-                        gh_webhook_ping(repository=repository, url=webhook.url)
+        if not self.secret:
+            return
+        # We re-register webhooks periodically, since they may be de-registered
+        # when one of the ci-scaler hosts terminates. In this case, all other
+        # remaining hosts (in the load balancing group) will recreate the
+        # webhooks eventually.
+        for repository, webhook in self.webhooks.items():
+            now = int(time.time())
+            if now > webhook.ensure_exists_at + WEBHOOK_ENSURE_EXISTS_INTERVAL_SEC:
+                webhook.ensure_exists_at = now
+                with logged_result(swallow=True):
+                    res = gh_webhook_ensure_exists(
+                        repository=repository,
+                        url=webhook.url,
+                        secret=self.secret,
+                        events=[WORKFLOW_RUN_EVENT, WORKFLOW_JOB_EVENT],
+                    )
+                    if res == "created":
+                        log(f"Re-created webhook for {repository}: {webhook.url}")
 
     def handle(
         self,
@@ -133,41 +150,52 @@ class HandlerWebhooks:
         data: dict[str, Any],
         data_bytes: bytes,
     ):
-        action = data.get("action")
-        run_payload = data.get(WORKFLOW_RUN_EVENT)
-        job_payload = data.get(WORKFLOW_JOB_EVENT)
-
         # For local debugging only! Allows to simulate a webhook with just
         # querying an URL that includes the repo name and label:
         # - /workflow_run/owner/repo/label
         # - /workflow_job/owner/repo/label/{queued|in_progress|completed}/job_id
+        extra_debug_labels: dict[str, int] = {}
         if (
             handler.client_address[0] == "127.0.0.1"
-            and not action
-            and not run_payload
-            and not job_payload
+            and not data.get("action")
+            and not data.get(WORKFLOW_RUN_EVENT)
+            and not data.get(WORKFLOW_JOB_EVENT)
         ):
             if match := re.match(
                 rf"^/{WORKFLOW_RUN_EVENT}/([^/]+/[^/]+)/([^/]+)/?$",
                 handler.path,
             ):
-                return self._handle_workflow_run_in_progress(
-                    handler=handler,
-                    repository=match.group(1),
-                    labels={match.group(2): 1},
-                )
+                extra_debug_labels[match.group(2)] = 1
+                data = {
+                    "action": "in_progress",
+                    "repository": {
+                        "full_name": match.group(1),
+                    },
+                    WORKFLOW_RUN_EVENT: {
+                        "id": crc32(match.group(2).encode()),
+                        "run_attempt": 1,
+                        "name": "test",
+                        "head_sha": "",
+                        "path": "/.github/workflows/ci.yml",
+                    },
+                }
             elif match := re.match(
                 rf"^/{WORKFLOW_JOB_EVENT}/([^/]+/[^/]+)/([^/]+)/([^/]+)/([^/]+)/?$",
                 handler.path,
             ):
-                return self._handle_workflow_job_timing(
-                    handler=handler,
-                    repository=match.group(1),
-                    labels={match.group(2): 1},
-                    action=cast(Any, match.group(3)),
-                    job_id=int(match.group(4)),
-                    name=None,
-                )
+                data = {
+                    "repository": {
+                        "full_name": match.group(1),
+                    },
+                    WORKFLOW_JOB_EVENT: {
+                        "id": int(match.group(4)),
+                        "run_attempt": 1,
+                        "name": "test",
+                        "labels": [match.group(2)],
+                    },
+                    "action": match.group(3),
+                    "job_id": int(match.group(4)),
+                }
             else:
                 return handler.send_error(
                     404,
@@ -177,17 +205,28 @@ class HandlerWebhooks:
                     + f"/{WORKFLOW_JOB_EVENT}/owner/repo/label/{'{queued|in_progress|completed}'}/job_id"
                     + f", but got {handler.path}",
                 )
+        else:
+            assert self.secret
+            error = verify_signature(
+                secret=self.secret,
+                headers=handler.headers,
+                data_bytes=data_bytes,
+            )
+            if error:
+                return handler.send_error(403, error)
 
+        action = data.get("action")
         repository: str | None = data.get("repository", {}).get("full_name", None)
-        if repository in self.webhooks:
-            self.webhooks[repository].last_delivery_at = int(time.time())
+        keys = [k for k in data.keys() if k not in IGNORE_KEYS]
+        workflow_run = data.get(WORKFLOW_RUN_EVENT)
+        workflow_job = data.get(WORKFLOW_JOB_EVENT)
 
         name = (
-            str(run_payload.get("name"))
-            if run_payload
-            else str(job_payload.get("name")) if job_payload else None
+            str(workflow_run.get("name"))
+            if workflow_run
+            else str(workflow_job.get("name")) if workflow_job else None
         )
-        keys = [k for k in data.keys() if k not in IGNORE_KEYS]
+
         if keys:
             handler.log_suffix = (
                 f"{{{','.join(keys)}}}"
@@ -201,23 +240,16 @@ class HandlerWebhooks:
         if not repository:
             return handler.send_json(202, message="ignoring event with no repository")
 
-        assert self.secret
-        error = verify_signature(
-            secret=self.secret,
-            headers=handler.headers,
-            data_bytes=data_bytes,
-        )
-        if error:
-            return handler.send_error(403, error)
-
-        if run_payload:
+        # This event is used for increasing the number of runners.
+        if workflow_run:
             if action != "requested" and action != "in_progress":
                 return handler.send_json(
                     202,
                     message='ignoring action != ["requested", "in_progress"]',
                 )
 
-            event_key = (int(run_payload["id"]), str(run_payload["run_attempt"]))
+            event_key = f"{workflow_run['id']}:{workflow_run['run_attempt']}"
+            handler.log_suffix += f" id={event_key}"
             processed_at = self.duplicated_events.get(event_key)
             if processed_at:
                 return handler.send_json(
@@ -225,8 +257,8 @@ class HandlerWebhooks:
                     message=f"ignoring event that has already been processed at {time.ctime(processed_at)}",
                 )
 
-            head_sha = str(run_payload["head_sha"])
-            path = str(run_payload["path"])
+            head_sha = str(workflow_run["head_sha"])
+            path = str(workflow_run["path"])
             message = f"{repository}{event_key}: downloading {os.path.basename(path)} and parsing jobs list"
             try:
                 cache_key = f"{repository}:{path}"
@@ -240,7 +272,7 @@ class HandlerWebhooks:
                     self.workflows[cache_key] = workflow
                 else:
                     message += f" (cached)"
-                labels = gh_predict_workflow_labels(
+                labels = extra_debug_labels | gh_predict_workflow_labels(
                     workflow=workflow,
                     known_labels=[
                         asg_spec.label
@@ -255,21 +287,23 @@ class HandlerWebhooks:
             except Exception as e:
                 return handler.send_error(500, f"{message} failed: {e}")
 
-            self.duplicated_events[event_key] = time.time()
+            self.duplicated_events[event_key] = int(time.time())
             return self._handle_workflow_run_in_progress(
                 handler=handler,
                 repository=repository,
                 labels=labels,
             )
 
-        if job_payload:
-            if action != "queued" and action != "in_progress" and action != "completed":
+        # This event is only used for statistics about timing.
+        if workflow_job:
+            allowed_actions = ["queued", "in_progress", "completed"]
+            if action not in allowed_actions:
                 return handler.send_json(
                     202,
-                    message='ignoring action != ["queued", "in_progress", "completed"]',
+                    message=f"ignoring action != {allowed_actions}",
                 )
 
-            event_key = (int(job_payload["id"]), action)
+            event_key = f"{workflow_job['id']}:{workflow_job['run_attempt']}:{action}"
             processed_at = self.duplicated_events.get(event_key)
             if processed_at:
                 return handler.send_json(
@@ -277,16 +311,17 @@ class HandlerWebhooks:
                     message=f"ignoring event that has already been processed at {time.ctime(processed_at)}",
                 )
 
-            self.duplicated_events[event_key] = time.time()
+            self.duplicated_events[event_key] = int(time.time())
             return self._handle_workflow_job_timing(
                 handler=handler,
                 repository=repository,
-                labels={label: 1 for label in job_payload["labels"]},
+                labels={label: 1 for label in workflow_job["labels"]},
                 action=action,
-                job_id=int(job_payload["id"]),
+                job_id=int(workflow_job["id"]),
                 name=name,
             )
 
+        # Unrecognized event, skipping.
         return handler.send_json(
             202,
             message=f"ignoring event with no {WORKFLOW_RUN_EVENT} and {WORKFLOW_JOB_EVENT}",
@@ -345,10 +380,11 @@ class HandlerWebhooks:
                 message=f"ignoring event, since no matching auto-scaling group(s) found for repository {repository} and labels {[*labels.keys()]}",
             )
 
-        timing = self.job_timings.get(job_id) or JobTiming(job_id=job_id)
-        self.job_timings[job_id] = timing
+        timing = self.job_timings.get(str(job_id))
+        if timing is None:
+            timing = JobTiming(job_id=job_id)
 
-        now = time.time()
+        now = int(time.time())
         if action == "queued":
             timing.queued_at = now
         elif action == "in_progress":
@@ -380,7 +416,9 @@ class HandlerWebhooks:
 
         for metric in timing.bumped:
             metrics.pop(metric, None)
-        timing.bumped.update(metrics.keys())
+        timing.bumped.extend(metrics.keys())
+
+        self.job_timings[str(job_id)] = timing
 
         if metrics:
             job_name = (
@@ -416,7 +454,14 @@ class HandlerWebhooks:
 
         return handler.send_json(
             200,
-            message=f"processed event for job_id={job_id}: {asg_spec}",
+            message=(
+                f"logged timing event for job_id={job_id}: {asg_spec}, "
+                + (
+                    ", ".join(f"{k}:{v}" for k, v in metrics.items())
+                    if metrics
+                    else "no metrics yet"
+                )
+            ),
         )
 
 
