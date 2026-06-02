@@ -3,7 +3,6 @@ on:
   pull_request:
     branches:
       - main
-      - grok/*/*
   push:
     branches:
       - main
@@ -16,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - run: |
           exec 2>&1; set -ex
           tests/all.sh
@@ -26,10 +25,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Disable default ci-storage remote host (store locally)
         run: |
           echo -n "" > ~/ci-storage-host
+
       - name: Create dummy files
         run: |
           echo "dummy" > dummy.txt
@@ -51,6 +51,7 @@ jobs:
           run-before: |
             set -ex
             echo "run-before" > run-before.txt
+
       - name: Test store (layer)
         uses: ./
         with:
@@ -58,6 +59,7 @@ jobs:
           storage-dir: ~/storage-dir
           layer-name: my-layer
           layer-include: layer.txt
+
       - name: Test store (custom local-dir)
         uses: ./
         with:
@@ -73,6 +75,7 @@ jobs:
           action: load
           storage-dir: ~/storage-dir
           hint: aaa
+
       - name: Check that dummy.txt and run-before.txt were restored
         run: |
           set -e
@@ -88,6 +91,7 @@ jobs:
           action: load
           storage-dir: ~/storage-dir
           layer-name: my-layer
+
       - name: Check that dir/subdir/layer.txt was restored, and dummy.txt still exists
         run: |
           set -e
@@ -103,6 +107,7 @@ jobs:
           action: load
           storage-dir: ~/storage-dir
           local-dir: /tmp/dir
+
       - name: Check that /tmp/dir/local-dir.txt was restored
         run: |
           set -e
@@ -114,7 +119,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - run: |
           exec 2>&1; set -ex
           docker/ci-scaler/guest/scaler/tests/all.sh
@@ -132,7 +137,7 @@ jobs:
       - ci-scaler-test
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Start test Docker containers
         run: |
           exec 2>&1; set -ex
@@ -166,7 +171,7 @@ jobs:
       - ci-scaler-test
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
       - name: Run test job inside the self-hosted runner
         run: echo "Hello, world!"
       - name: Test store using GitHub Action
@@ -176,134 +181,47 @@ jobs:
       - name: Kill ci-runner container
         run: kill -SIGINT $(cat ~guest/.entrypoint.pid)
 
-  # Publishes ci-scaler image.
-  push-ci-scaler:
+  # Builds the ci-storage, ci-scaler, and ci-runner images, and on non-PR events
+  # pushes them to GHCR (ghcr.io/<owner>/<image>). On pull_request events the
+  # images are built (validating the Dockerfiles across the platform matrix) but
+  # not pushed, and the GHCR login is skipped. Pushes use the built-in
+  # GITHUB_TOKEN with packages: write, so no registry PAT is required. Decoupled
+  # from the self-hosted integration tests on purpose: those require CI_PAT and
+  # runner infra, and must not block image publishing.
+  push-images:
     runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
     needs:
       - ci-storage-tool-test
       - ci-storage-action-test
-      - ci-scaler-test
-      - build-and-boot-containers
-      - spawn-job-test
     timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ci-storage
+          - ci-scaler
+          - ci-runner
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/metadata-action@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 #v4.1.0
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 #v4.1.0
+      - uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 #v6.1.0
         id: meta
         with:
-          images: |
-            dimikot/ci-scaler
-            ghcr.io/${{ github.repository_owner }}/ci-scaler
-      - uses: docker/login-action@v3
-        with:
-          username: dimikot
-          password: ${{ secrets.DOCKERHUB_PAT }}
-      - uses: docker/login-action@v3
+          images: ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee #4.2.0
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
+      - uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf #v7.2.0
         with:
-          context: docker/ci-scaler
+          context: docker/${{ matrix.image }}
           platforms: linux/amd64,linux/arm64,linux/arm64/v8
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-      - uses: peter-evans/dockerhub-description@v3
-        with:
-          username: dimikot
-          password: ${{ secrets.DOCKERHUB_PAT }}
-          readme-filepath: docker/ci-scaler/README.md
-          repository: dimikot/ci-scaler
-
-  # Publishes ci-storage image.
-  push-ci-storage:
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    needs:
-      - ci-storage-tool-test
-      - ci-storage-action-test
-      - ci-scaler-test
-      - build-and-boot-containers
-      - spawn-job-test
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: |
-            dimikot/ci-storage
-            ghcr.io/${{ github.repository_owner }}/ci-storage
-      - uses: docker/login-action@v3
-        with:
-          username: dimikot
-          password: ${{ secrets.DOCKERHUB_PAT }}
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: docker/ci-storage
-          platforms: linux/amd64,linux/arm64,linux/arm64/v8
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-      - uses: peter-evans/dockerhub-description@v3
-        with:
-          username: dimikot
-          password: ${{ secrets.DOCKERHUB_PAT }}
-          readme-filepath: docker/ci-storage/README.md
-          repository: dimikot/ci-storage
-
-  # Publishes ci-runner image.
-  push-ci-runner:
-    runs-on: ubuntu-latest
-    if: github.event_name != 'pull_request'
-    needs:
-      - ci-storage-tool-test
-      - ci-storage-action-test
-      - ci-scaler-test
-      - build-and-boot-containers
-      - spawn-job-test
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
-      - uses: docker/metadata-action@v5
-        id: meta
-        with:
-          images: |
-            dimikot/ci-runner
-            ghcr.io/${{ github.repository_owner }}/ci-runner
-      - uses: docker/login-action@v3
-        with:
-          username: dimikot
-          password: ${{ secrets.DOCKERHUB_PAT }}
-      - uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v5
-        with:
-          context: docker/ci-runner
-          platforms: linux/amd64,linux/arm64,linux/arm64/v8
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-      - uses: peter-evans/dockerhub-description@v3
-        with:
-          username: dimikot
-          password: ${{ secrets.DOCKERHUB_PAT }}
-          readme-filepath: docker/ci-runner/README.md
-          repository: dimikot/ci-runner
