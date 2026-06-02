@@ -23,7 +23,7 @@ services:
    your-redis-container:
       ...   
    ci-storage:
-      image: ghcr.io/dimikot/ci-storage:latest
+      image: ghcr.io/time-loop/ci-storage:latest
       ports:
          - 10022:22/tcp
       environment:

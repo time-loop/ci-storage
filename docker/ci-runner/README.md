@@ -91,7 +91,7 @@ have a custom image on top of the default ci-runner image functionality, so it
 will be automatically built and started on `docker compose up`.
 
 ```Dockerfile
-FROM ghcr.io/dimikot/ci-runner:latest
+FROM ghcr.io/time-loop/ci-runner:latest
 RUN true \
     && apt-get update \
     && apt-get install -y nodejs redis-tools postgresql-client coreutils \

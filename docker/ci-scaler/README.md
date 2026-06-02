@@ -32,7 +32,7 @@ Example for docker compose:
 services:
    ...
    ci-scaler:
-      image: ghcr.io/dimikot/ci-scaler:latest
+      image: ghcr.io/time-loop/ci-scaler:latest
       ports:
         - 18088:8088/tcp
       environment:
