@@ -9,7 +9,7 @@ Guidance for Claude Code when working in this repository.
 self-hosted GitHub Actions runner infrastructure with fast work-directory
 caching. It ships several things that work together:
 
-- **`ci-storage`** — a Bash CLI (repo root, the `ci-storage` file) that
+- **`ci-storage`** — a Python CLI (repo root, the `ci-storage` file) that
   stores/loads a work directory to/from a remote rsync-based storage host,
   using `rsync --link-dest` for differential speed. Also a GitHub Action
   (`action.yml`) wrapping it.
@@ -66,6 +66,14 @@ tags. Jobs:
 - The READMEs under `docker/*/` reference `ghcr.io/time-loop/*` as the canonical
   pull path. `time-loop/sd` may still reference `ghcr.io/dimikot/*` until
   repointed in a separate PR.
+- **Image behavior can drift between rebuilds with zero repo changes** — the
+  Dockerfiles `apt-get install` unpinned packages. This broke the first sd
+  image swap (sd PR #33557): a rebuilt image picked up rsync
+  `3.2.7-0ubuntu0.22.04.6`, whose security patches rejected the tool's relative
+  `--link-dest=../<slot>/` (RsyncProject/rsync#915), causing sporadic
+  `Permission denied (13)` / exit-23 store failures. Fixed in `.7` (USN-8349-2).
+  When debugging image-only regressions, diff `dpkg-query -W` across images
+  before suspecting repo content.
 
 ## Conventions
 
