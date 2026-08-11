@@ -39,7 +39,7 @@ if [[ "$FORWARD_HOST" != "" && "$FORWARD_PORTS" != "" ]]; then
       i=0
       for host in $hosts; do
         # ipv4 is needed for e.g. host.docker.internal
-        tcp_line="  server server$i $host:$port resolvers res resolve-prefer ipv4 check inter 10s fall 6 rise 6"
+        tcp_line="  server server$i $host:$port resolvers res resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 6 rise 6"
         if [[ $i == 0 ]]; then
           tcp_lines+=("$tcp_line")
         else
