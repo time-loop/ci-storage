@@ -1,4 +1,4 @@
-# haproxy `init-addr` — let the runner start when the storage host does not resolve
+# haproxy `init-addr` — state the address-resolution fallback explicitly on the generated server line
 
 CLK-1515194, Payload A only.
 
@@ -12,15 +12,18 @@ before starting haproxy. Every TCP backend it emits comes from one template line
 
 Because that line names `$host` as an FQDN, haproxy must turn it into an address at
 startup. haproxy's `init-addr` default is `last,libc`: try the address recorded in a
-server-state file, then the libc resolver. When every method in the list fails, haproxy
-throws a fatal error and **refuses to start** — which is where this spec's original
-premise stood. The entrypoint's `/etc/init.d/haproxy start` would fail under `set -e`,
-the runner would never come up, and a container that booted while its storage host
-happened to be unresolvable would be permanently dead rather than temporarily degraded,
-staying dead after the name resolved again because nothing restarts it.
+server-state file, then the libc resolver.
+
+This spec's original premise — stated here only to be retired — ran: when every method in
+the list fails haproxy throws a fatal error and refuses to start, so the entrypoint's
+`/etc/init.d/haproxy start` would fail under `set -e`, the runner would never come up,
+and a container that booted while its storage host happened to be unresolvable would be
+permanently dead rather than temporarily degraded, staying dead after the name resolved
+again because nothing restarts it.
 
 **That premise is false for this config, and verification proved it before the change
-shipped.** Every server line the script emits already carries `resolvers res`, and that
+shipped.** The fatal-error behavior is real in general, but it is not what this script's
+config does. Every server line the script emits already carries `resolvers res`, and that
 clause alone downgrades a failed startup lookup from a fatal `[ALERT]`/exit-1 to a
 non-fatal `[WARNING] ... could not resolve address ..., disabling server`. haproxy
 already bound its listeners and lived; the runner was never left dead by an unresolvable
@@ -32,25 +35,38 @@ keyword only makes a difference once `resolvers res` is absent from the server l
 shape no code path here produces.
 
 The one-line change ships anyway, as hygiene rather than as a fix. Adding `none` to the
-end of the chain is haproxy's documented escape hatch — the server starts with no
-address, in a down state, and the `resolvers res` section brings it up once the name
-resolves — and writing it explicitly states the intended startup behavior where a reader
-looks for it, instead of leaving it an emergent property of the resolvers section. It is
-defense in depth: inert today, effective only if a future path ever emits a server line
-without `resolvers res`. Nothing in this spec may be read as claiming a startup-behavior
-improvement or a CI failure-rate improvement.
+end of the chain is haproxy's documented escape hatch for an unresolvable name at
+startup, and writing it explicitly states the intended address-resolution fallback where
+a reader looks for it, instead of leaving it an emergent property of the resolvers
+section. On today's shape it is inert.
+
+Be precise about what it would buy on the one shape where it is *not* inert, because the
+obvious reading is wrong. On a server line that still carries `resolvers res`, an
+unresolvable name yields a server disabled at startup that the resolvers section brings
+back once the name resolves — but that is true with or without the keyword, which is
+exactly why it is inert. On a server line *without* `resolvers res` — the only shape the
+keyword changes — there is by construction no resolvers section attached to that server,
+so nothing ever re-resolves it: `none` turns a loud `[ALERT]`/exit-1 into a server
+disabled at startup and **left disabled for the process's lifetime**. The keyword
+therefore trades fail-fast for fail-silent on that shape rather than buying recovery. It
+ships as a small, documented statement of intent, not because that trade is clearly
+favourable; a future path that emits resolvers-less server lines needs a resolvers
+section far more than it needs this keyword. Nothing in this spec may be read as claiming
+a startup-behavior improvement or a CI failure-rate improvement.
 
 This spec covers that one-line change and nothing else. Payload B (health-check
 retuning) and Payload C (the proof runbook) are explicitly out of scope; see the
 principle blocks below.
 
 ## decision: Add init-addr last,libc,none to the generated haproxy server line
-description: append the documented none fallback as defense in depth — measurement shows the shipping config already survives an unresolvable $FORWARD_HOST via the pre-existing resolvers res clause, so the keyword is inert today and bites only if a future path emits a server line without resolvers
+description: append the documented none fallback so the intended resolution chain is stated on the line itself — measurement shows the shipping config already survives an unresolvable $FORWARD_HOST via the pre-existing resolvers res clause, so the keyword is inert today, and on a resolvers-less line it trades a startup abort for a permanently disabled backend rather than buying recovery
 relies_on: health-check-tuning-is-held-with-payload-b
 tags: ci-runner, haproxy, dns, startup, defense-in-depth
 
 Edit the single `tcp_line=` assignment in
-`docker/ci-runner/root/entrypoint.09-forward.sh` (line 42) to read:
+`docker/ci-runner/root/entrypoint.09-forward.sh` — line 42 as of this commit, but the
+`tcp_line=` assignment is unique in the file, so match on it rather than on the number,
+and re-derive the line numbers used below if the file has shifted — to read:
 
 ```bash
 tcp_line="  server server$i $host:$port resolvers res resolve-prefer ipv4 init-addr last,libc,none check inter 10s fall 6 rise 6"
@@ -73,8 +89,9 @@ Three properties of this placement are deliberate:
   `none` fallback — and on the shipping shape even that delta is unobservable, per the
   correction above. `last` is separately inert in this config: there is no
   `server-state-file` or `load-server-state-from-file`, so there is never a recorded
-  address to reuse. Both cost nothing and become live if state files are adopted or if
-  a server line ever loses `resolvers res`.
+  address to reuse. Both cost nothing. `last` becomes genuinely useful if server-state
+  files are ever adopted; `none` only ever changes a resolvers-less line, and there it
+  buys fail-silent rather than recovery, per the correction above.
 
 Do not make the keyword conditional, env-gated, or configurable. It ships
 unconditionally.
@@ -116,12 +133,14 @@ before this diff, not from `init-addr last,libc,none`, which is inert on every l
 script emits.
 
 What still holds, as a property of the pre-existing config rather than a consequence of
-this diff: when the name does not resolve at startup the backend starts **down**, so
-traffic arriving at `127.0.0.1:<port>` before the name resolves gets a connection the
-backend cannot serve, where a hard abort would instead have left the port unlistened.
-Once the name resolves, `check inter 10s fall 6 rise 6` needs six passing checks at 10s
-intervals — roughly a minute — before the backend carries traffic. That recovery window
-is the subject of the held Payload B retune and is knowingly left as-is here.
+this diff: when the name does not resolve at startup the backend starts **down** while
+haproxy binds and lives, so traffic arriving at `127.0.0.1:<port>` before the name
+resolves gets a connection the backend cannot serve. No hard abort is involved on this
+shape in either direction — measurement showed haproxy staying alive and bound with and
+without the keyword — so this is a description of the status quo, not a trade this diff
+makes. Once the name resolves, `check inter 10s fall 6 rise 6` needs six passing checks
+at 10s intervals — roughly a minute — before the backend carries traffic. That recovery
+window is the subject of the held Payload B retune and is knowingly left as-is here.
 
 ## principle: Health-check tuning is held with Payload B
 description: check inter 10s fall 6 rise 6 stays byte-identical; the 2c retune is deferred pending the Payload C verdict
@@ -142,17 +161,20 @@ outcome on its own.
 Concretely: the diff for this change is one modified line in one file, plus this
 spec. Anything else in the diff is a scope breach.
 
-## principle: Claim only defense in depth — never a repaired restart path, never a CI failure-rate improvement
-description: measurement took the restart-path claim away; commit and PR text may claim only the inert defense-in-depth scope, and must disclaim CI failure-rate impact explicitly
+## principle: Claim only an explicit resolution fallback — never a repaired restart path, never a CI failure-rate improvement
+description: measurement took the restart-path claim away and found no behavioral benefit on any shape this repo emits; commit and PR text may claim only an explicit statement of the intended resolution fallback, and must disclaim CI failure-rate impact explicitly
 tags: delivery, honesty, pr, defense-in-depth
 
 The claim available to us is narrower than this principle first stated. Its original
 premise — "this change repairs the restart path: haproxy now starts and binds when
 `$FORWARD_HOST` is unresolvable at boot" — was falsified by verification step 3: the
 generated config already started and bound in that case, via the pre-existing
-`resolvers res` clause. Adding `init-addr last,libc,none` is defense in depth on the
-shipping shape, inert today, effective only if a future path emits a server line without
-`resolvers res`. That, and nothing larger, is what commit and PR text may claim.
+`resolvers res` clause. Adding `init-addr last,libc,none` is inert on the shipping shape,
+and on the only shape it changes — a resolvers-less server line — it converts a startup
+abort into a permanently disabled backend rather than into a recovering one. So the claim
+is narrower still than "defense in depth" suggests: this is an explicit statement of the
+intended resolution fallback, with no measured behavioral benefit on anything the repo
+currently emits. That, and nothing larger, is what commit and PR text may claim.
 
 Two disclaimers are therefore mandatory, not optional. The text MUST NOT claim or imply
 an improvement in CI failure rate — that attribution is unearned here, and the fix that
@@ -191,6 +213,14 @@ proof of behavior.
    script: on macOS a naive source silently sails past the undefined `say` because
    `/usr/bin/say` exists, then dies writing `/etc/haproxy/haproxy.cfg.new`, producing
    a confusing failure unrelated to the code under test.
+
+   Know the harness's one infidelity: the extracted range starts at line 20, so it
+   omits line 18's `FORWARD_HOST=$(echo "$FORWARD_HOST" | sed -E 's/:[0-9]+//g')`, the
+   port-stripping step that supports the documented `host:ignored_port` input. Pass
+   `FORWARD_HOST` already port-free, as above, and the omission is harmless; pass
+   `a.invalid:9999` and the harness emits `a.invalid:9999:22` where production emits
+   `a.invalid:22`. That divergence is the harness's, not the code's — do not report it
+   as a finding, and do not use the harness to reason about port-bearing input.
 
    This is a scratch harness, not a committed test: `tests/` here is scaffolding for
    the `ci-storage` CLI (`tests/common.sh` drives `../ci-storage` directly, `all.sh`
