@@ -1,0 +1,9 @@
+# Third-party images mirrored to ghcr.io/<owner>/mirror/<path>:<tag> by
+# .github/workflows/mirror-images.yml, so self-hosted runners pull them from
+# GHCR instead of anonymously from Docker Hub.
+#
+# One image per line: <Docker Hub path>:<tag>@<digest>. The digest pins what is
+# copied; the mirror keeps the same digest, so consumers can pin it too.
+bitnamilegacy/redis-cluster:6.2.16@sha256:d973a2aa8b6688190ca4e4544b2ff859ef1e9f8081518558270df34e23ff1df7
+bitnamilegacy/redis:6.2.16@sha256:116419dc09f37b2c37e47e1a2cef258620ca1a30bae379b3660cf78fc0e7fc99
+library/alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507

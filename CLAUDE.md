@@ -31,7 +31,10 @@ The primary downstream consumer of the images is a **separate repo,
   scripts (`root/entrypoint.NN-*.sh` run as root, `guest/entrypoint.NN-*.sh` as
   the runner user, in numeric order).
 - `docker/compose.yml` — local/integration testing of all three images together.
-- `.github/workflows/ci.yml` — the only workflow.
+- `.github/workflows/ci.yml` — tests and publishes the three images.
+- `.github/workflows/mirror-images.yml` + `docker/mirror-images.txt` — copies
+  pinned third-party images (the `time-loop/sd` shard Redis) from Docker Hub to
+  `ghcr.io/time-loop/mirror/*`, so runners never pull Docker Hub anonymously.
 - `PUBLISH.md` — release + GHCR publishing instructions.
 
 ## CI / publishing

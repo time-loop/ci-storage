@@ -1,0 +1,63 @@
+name: Mirror Images
+on:
+  pull_request:
+    branches:
+      - main
+    paths:
+      - docker/mirror-images.txt
+      - .github/workflows/mirror-images.yml
+  push:
+    branches:
+      - main
+    paths:
+      - docker/mirror-images.txt
+      - .github/workflows/mirror-images.yml
+  workflow_dispatch:
+
+jobs:
+  # Copies every image in docker/mirror-images.txt from Docker Hub to
+  # ghcr.io/<owner>/mirror/<path>:<tag>, byte-for-byte (same digest, all
+  # platforms). Same model as push-images in ci.yml: the built-in GITHUB_TOKEN
+  # with packages: write, no registry PAT, and on pull_request events nothing is
+  # pushed, only checked. The pinned digest is what gets copied, so a tag that
+  # moves upstream only raises a warning.
+  mirror-images:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      MIRROR_PREFIX: ghcr.io/${{ github.repository_owner }}/mirror
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" |
+            skopeo login ghcr.io --username "${{ github.actor }}" --password-stdin
+      - name: Check or copy each image
+        run: |
+          set -euo pipefail
+          grep -Ev '^[[:space:]]*(#|$)' docker/mirror-images.txt | while read -r line; do
+            ref="${line%@*}"
+            digest="${line#*@}"
+            source="docker://docker.io/${ref%:*}@$digest"
+            skopeo inspect --raw "$source" > /dev/null
+            tag_digest="$(skopeo inspect --raw "docker://docker.io/$ref" | sha256sum | cut -d' ' -f1)"
+            if [[ "sha256:$tag_digest" != "$digest" ]]; then
+              echo "::warning::$ref now resolves to sha256:$tag_digest, not the pinned $digest; the pinned digest is still what gets mirrored."
+            fi
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              echo "ok  $ref@$digest"
+              continue
+            fi
+            dest="docker://$MIRROR_PREFIX/$ref"
+            skopeo copy --all --preserve-digests "$source" "$dest"
+            mirrored="sha256:$(skopeo inspect --raw "$dest" | sha256sum | cut -d' ' -f1)"
+            if [[ "$mirrored" != "$digest" ]]; then
+              echo "::error::$MIRROR_PREFIX/$ref has digest $mirrored after the copy, expected $digest."
+              exit 1
+            fi
+            echo "mirrored  $MIRROR_PREFIX/$ref@$digest"
+          done
