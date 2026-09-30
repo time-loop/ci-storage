@@ -35,6 +35,23 @@ Do this for `ci-storage`, `ci-scaler`, and `ci-runner`. This may require org
 admin privileges. Public visibility lets downstream consumers (e.g.
 `time-loop/sd`) pull the images anonymously.
 
+## Mirrored third-party images
+
+`.github/workflows/mirror-images.yml` copies each image pinned in
+`docker/mirror-images.txt` from Docker Hub to
+`ghcr.io/time-loop/mirror/<path>:<tag>` with the same digest, using the same
+`GITHUB_TOKEN` login as above. It runs when either file changes on `main`, and
+on demand via "Run workflow". To mirror a new image, add its
+`<path>:<tag>@<digest>` line and merge; the first run creates the package,
+which then needs the same one-time switch to public:
+
+- `mirror/bitnamilegacy/redis-cluster`
+- `mirror/bitnamilegacy/redis`
+- `mirror/library/alpine`
+
+Add the image here before any consumer points at it: a consumer that pulls a
+missing or still-private mirror package fails its pull.
+
 ## Release a new GitHub Action version
 
 To release a new GitHub Action version to the GitHub Marketplace (example for v1
